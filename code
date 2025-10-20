@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+
+import numpy as np
+import pandas as pd
+import datetime
+import matplotlib.pyplot as plt
+
+import yfinance as yf
+import feedparser
+from transformers import pipeline
+import torch
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Bidirectional, GRU, Dropout, Dense
+from tensorflow.keras.callbacks import EarlyStopping
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Define all your “magic numbers” and file names up front.
+# Hint: Changing TICKER here changes everything downstream.
+# TODO: Try setting TICKER
+TICKER        = "TSLA"
+YEARS         = 5
+TIME_STEPS    = 60
+BATCH_SIZE    = 32
+EPOCHS        = 30
+RSS_MAX       = 500
+FORECAST_DAYS = 5
+MODEL_FILE    = "gru_stock_model.h5"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Download & flatten price data
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Explanation:
+#   Fetch the historical “Close” prices for TICKER over the last YEARS years,
+#   drop any missing rows, reset the index, and ensure the DataFrame has exactly
+#   two columns: Date (as a Python date) and Close.
+
+# Hint:
+#   • Use yf.download(TICKER, period=f"{YEARS}y")[["Close"]] to grab only the Close column.
+#   • Call .dropna() to remove rows with missing values, then .reset_index().
+#   • After reset_index(), raw.columns[0] holds the date column’s name (it might be "DateTime" or "index").
+#   • If raw.columns is a pd.MultiIndex, collapse it with raw.columns.droplevel(1).
+#   • Rename raw.columns[0] → "Date" and convert with pd.to_datetime(...).dt.date.
+
+print(f"1) Downloading {YEARS}y of {TICKER} prices…")
+raw = (
+    yf.download(TICKER, period=f"{YEARS}y")[["Close"]]
+      .dropna()
+      .reset_index()
+)
+
+# if MultiIndex columns, drop level 1
+if isinstance(raw.columns, pd.MultiIndex):
+    raw.columns = raw.columns.droplevel(1)
+
+# ensure we have ['Date','Close']
+raw.rename(columns={ raw.columns[0]: "Date" }, inplace=True)
+raw["Date"] = pd.to_datetime(raw["Date"]).dt.date
+
+prices = raw[["Date","Close"]]
+print("   head of prices:\n", prices.head(), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) Scrape Yahoo Finance RSS headlines
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Explanation:
+#   Fetch up to RSS_MAX recent news headlines for TICKER from Yahoo Finance’s RSS feed.
+#   Each entry has a published timestamp and title; we want a DataFrame of Date & Title.
+
+# Hint:
+#   • Construct the RSS URL as
+#       f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={TICKER}&region=US&lang=en-US"
+#   • Use feedparser.parse(url) to read the feed.
+#   • Loop over feed.entries[:RSS_MAX], extract:
+#       – entry.published_parsed (a time.struct_time) → convert to Python date
+#       – entry.title
+#   • Build a list of (date, title) tuples and then pd.DataFrame(..., columns=["Date","Title"]).
+#   • If the resulting DataFrame is empty, raise a RuntimeError.
+
+print("2) Scraping RSS headlines…")
+rss_url = (
+    ### TODO: fill in the RSS URL using TICKER ###
+    # e.g. f"https://feeds.finance.yahoo.com/rss/2.0/headline?..."
+    f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={TICKER}&region=US&lang=en-US")
+
+feed = feedparser.parse(rss_url)
+
+records = []
+for entry in feed.entries[:RSS_MAX]:
+    # TODO: convert entry.published_parsed (tuple) into a datetime.date
+    #       Hint: datetime.datetime(*entry.published_parsed[:6]).date()
+    dt = datetime.datetime(*entry.published_parsed[:6]).date()
+
+    # TODO: get the headline text
+    title = entry.title
+
+    records.append((dt, title))
+
+# TODO: build a DataFrame named rss_df with columns ["Date","Title"]
+#       Hint: pd.DataFrame(records, columns=[...])
+rss_df = pd.DataFrame(records, columns=["Date","Title"])
+
+# TODO: if rss_df is empty, raise RuntimeError("No RSS entries found—check your connection")
+if rss_df is []:
+  raise RuntimeError("No RSS entries found—check your connection")
+
+print("   head of RSS:\n", rss_df.head(), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) Sentiment scoring with FinBERT
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Explanation:
+#   We want to take each headline title and produce a signed sentiment score
+#   (positive → +score, negative → −score) using a finance-tuned BERT model.
+#   This gives us a numeric “Score” column to feed into our time-series model.
+
+# Hint:
+#   • Detect CPU vs GPU with torch.cuda.is_available()
+#   • Initialize a transformers pipeline via:
+#       pipeline("sentiment-analysis", model="ProsusAI/finbert", device=...)
+#   • Write a function `score_titles` that takes a list of strings and:
+#       – calls the pipeline on each title
+#       – maps label “POSITIVE” → +score, “NEGATIVE” → −score
+#       – returns a NumPy array of floats
+#   • Apply that function to rss_df["Title"] and store results in rss_df["Score"]
+
+print("3) Loading FinBERT…")
+# TODO: choose device index: 0 if CUDA available, else -1
+if torch.cuda.is_available():
+  device = 0
+else:
+  device = -1
+
+# TODO: create a sentiment-analysis pipeline named sentpipe
+#       using model "ProsusAI/finbert" on the chosen device
+sentpipe = pipeline("sentiment-analysis", model="ProsusAI/finbert", device = device)
+
+def score_titles(titles):
+    """
+    Given a list of headline strings, return an array of signed sentiment scores.
+    """
+    out = []
+    for t in titles:
+        # TODO: call sentpipe on t, grab the first result dict
+        res = sentpipe(t)[0]
+        # TODO: if res["label"].lower() == "positive", sign=+1 else sign=-1
+        if res["label"].lower() == "positive":
+          sign = 1
+        else:
+          sign = -1
+        # TODO: append sign * res["score"] to out
+        out.append(sign * res["score"])
+    # Return as NumPy array of type float
+    return np.array(out, dtype=float)
+
+print("   Scoring headlines…")
+# TODO: invoke score_titles on the list of titles and save to rss_df["Score"]
+rss_df["Score"] = score_titles(rss_df["Title"].tolist())
+print("   head with scores:\n", rss_df.head(), "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) Aggregate daily sentiment
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Combine all headline scores per Date → (mean, extreme).
+# Hint: df.groupby("Date")["Score"].agg(...)
+print("4) Aggregating daily sentiment…")
+daily = (
+    rss_df
+      .groupby("Date")["Score"]
+      .agg(
+         mean_sentiment    = "mean",
+         extreme_sentiment = lambda x: x.abs().max() * np.sign(x.mean())
+      )
+      .reset_index()
+)
+print("   head of daily sentiment:\n", daily.head(), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) Merge prices + sentiment
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Left-join price rows with daily sentiment (fill missing with 0).
+# Hint: pd.merge(prices, daily, on="Date", how="left").fillna(0.0)
+print("5) Merging price + sentiment…")
+df = pd.merge(prices, daily, on="Date", how="left").fillna(0.0)
+print("   head of merged:\n", df.head(), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) Scale & build sequences [ScaledClose, mean_sentiment]
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Explanation:
+#   We first normalize the “Close” price into [0,1] so that our RNN trains faster.
+#   Then we slide a fixed‐length window (TIME_STEPS) over the two streams—
+#   the scaled close‐price and the daily mean sentiment—to build (X, y) for training.
+
+# Hint:
+#   • Use sklearn’s MinMaxScaler().fit_transform on df[["Close"]] to get a 2D array.
+#   • To build sequences, stack the two 1D arrays and transpose so each step is [price, sentiment].
+#   • Return X as shape (num_samples, TIME_STEPS, 2) and y as (num_samples,).
+
+print("6) Scaling & building sequences…")
+scaler = MinMaxScaler((0,1))
+df["ScaledClose"] = scaler.fit_transform(df[["Close"]])
+
+def make_sequences(df, ts):
+    X, y = [], []
+    c = df["ScaledClose"].values
+    s = df["mean_sentiment"].values
+    for i in range(len(df) - ts):
+        seq = np.vstack([c[i:i+ts], s[i:i+ts]]).T
+        X.append(seq)
+        y.append(c[i+ts])
+    return np.array(X), np.array(y)
+
+X, y = make_sequences(df, TIME_STEPS)
+print(f"   X shape: {X.shape}, y shape: {y.shape}\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) Train/test split (no shuffle)
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Keep time order for forecasting—no random shuffle.
+# Hint: train_test_split(..., shuffle=False)
+# TODO: Split X,y into X_train, X_test, y_train, y_test with test_size=0.2.
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, shuffle=False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8) Build & train Bidirectional GRU   (Exercise)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Explanation:
+#   Construct a small recurrent network that processes the sequence both
+#   forward and backward (bidirectional GRU), followed by a few dense layers,
+#   then train it to minimize mean squared error on our time-series data.
+
+# Hint:
+#   • Use Keras Sequential API.
+#   • First layer: Bidirectional(GRU(128, return_sequences=True), input_shape=(TIME_STEPS, 2))
+#   • Then Dropout, another Bidirectional GRU(64), Dropout, Dense(32, 'relu'), Dense(1).
+#   • Compile with loss="mse" and optimizer="adam".
+#   • Fit on (X_train, y_train) with validation_data=(X_test, y_test),
+#     epochs=EPOCHS, batch_size=BATCH_SIZE, and an EarlyStopping callback.
+
+print("8) Training Bidirectional GRU…")
+
+# TODO: define the model architecture
+print("8) Training Bidirectional GRU…")
+model = Sequential([
+    Bidirectional(GRU(128, return_sequences=True),
+                  input_shape=(TIME_STEPS, 2)),
+    Dropout(0.3),
+    Bidirectional(GRU(64)),
+    Dropout(0.3),
+    Dense(32, activation="relu"),
+    Dense(1)
+])
+model.compile(optimizer="adam", loss="mse")
+model.summary()
+
+early = EarlyStopping(
+    monitor="val_loss", patience=5, restore_best_weights=True
+)
+model.fit(
+    X_train, y_train,
+    validation_data=(X_test, y_test),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=[early],
+    verbose=1
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9) Evaluate on hold-out
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Explanation:
+#   Now that the GRU has been trained, we want to see how well it forecasts
+#   on the unseen (hold-out) portion of our data. We’ll compute two standard
+#   regression metrics: Root Mean Squared Error (RMSE) and Mean Absolute Error (MAE).
+#   Since we trained on scaled prices, we must invert the scaling before calculating errors.
+
+# Hint:
+#   • Call model.predict(X_test) to get your scaled predictions (shape (n,1)).
+#   • Use y_test.reshape(-1,1) to match dimensions for inverse_transform.
+#   • Pass both arrays through scaler.inverse_transform(...) to recover dollar values.
+#   • Finally, compute rmse = sqrt(mean_squared_error(true, pred)) and mae = mean_absolute_error(true, pred).
+
+print("9) Evaluating…")
+pred_s = model.predict(X_test)
+true_s = y_test.reshape(-1,1)
+
+pred = scaler.inverse_transform(pred_s)
+true = scaler.inverse_transform(true_s)
+
+rmse = np.sqrt(mean_squared_error(true, pred))
+mae  = mean_absolute_error(true, pred)
+print(f"   Test RMSE: {rmse:.2f}, MAE: {mae:.2f}\n")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10) Save model
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Persist your trained weights for later use.
+# Hint: model.save(filename) writes an HDF5 or .keras file.
+# TODO: Save to MODEL_FILE and confirm it exists.
+model.save(MODEL_FILE)
+print(f"10) Model saved to {MODEL_FILE}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11) Plot actual vs predicted
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Visualize how close your predictions are to reality.
+# Hint: Align X-axis with the last len(y_test) dates from df["Date"].
+# TODO: Extract test_dates, then plt.plot(true) vs plt.plot(pred).
+print("11) Plotting…")
+test_dates = df["Date"].values[-len(y_test):]
+
+plt.figure(figsize=(12,5))
+plt.plot(test_dates, true,   label="Actual", color="blue")
+plt.plot(test_dates, pred,   label="Predicted",
+         linestyle="--", color="orange")
+plt.xticks(rotation=45)
+plt.legend(); plt.grid(); plt.tight_layout()
+plt.show()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12) Rolling forward forecast
+# ─────────────────────────────────────────────────────────────────────────────
+# Explanation: Use the last sequence and step forward FORECAST_DAYS times.
+# Hint: Each new step uses yesterday’s features plus the last sentiment.
+# TODO: Implement the loop to generate f_scaled → f_prices → plot with f_dates.
+print(f"12) Forecasting next {FORECAST_DAYS} days…")
+last_seq = X[-1].copy()
+f_scaled = []
+for _ in range(FORECAST_DAYS):
+    nxt = float(model.predict(last_seq[np.newaxis,:,:])[0,0])
+    f_scaled.append(nxt)
+    last_seq = np.vstack([
+        last_seq[1:],
+        [nxt, df["mean_sentiment"].iat[-1]]
+    ])
+
+f_prices = scaler.inverse_transform(
+    np.array(f_scaled).reshape(-1,1)
+).flatten()
+f_dates = [
+    df["Date"].iat[-1] + datetime.timedelta(days=i+1)
+    for i in range(FORECAST_DAYS)
+]
+
+plt.figure(figsize=(10,5))
+plt.plot(df["Date"].iloc[-TIME_STEPS:],
+         df["Close"].iloc[-TIME_STEPS:],
+         label="Last 60d", color="blue")
+plt.plot(f_dates, f_prices,
+         marker="o", label="Forecast", color="orange")
+plt.xticks(rotation=45)
+plt.legend(); plt.grid(); plt.tight_layout()
+plt.show()
